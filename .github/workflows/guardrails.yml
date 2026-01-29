@@ -1,191 +1,65 @@
-name: Code Review Guardrails
-
-on:
+name: Enterprise Guardrails
+on: 
   pull_request:
     types: [opened, synchronize]
 
 jobs:
-  scan-code:
-    name: Scan PR Code
+  guardrails-check:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
       contents: read
-
+    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Scan with external API
+      - uses: actions/checkout@v4
+      
+      - name: Hybrid Analysis Engine
         uses: actions/github-script@v7
+        env:
+          # ADD THIS SECRET IN GITHUB SETTINGS -> SECRETS -> ACTIONS
+          API_URL: ${{ secrets.GUARDRAILS_URL }} 
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const https = require('https');
-            const http = require('http');
-
-            // Configuration
-            const API_URL = 'https://wearish-chanda-expiational.ngrok-free.dev';
-            const ENDPOINT = '/scan';
-            const API_KEY = '';
-
-            // Get PR info
-            const pr = context.payload.pull_request;
-            const prNumber = pr.number;
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-
-            // Step 1: Get PR diff
-            console.log('📥 Fetching PR diff...');
             const diff = await github.rest.pulls.get({
-              owner,
-              repo,
-              pull_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
               mediaType: { format: 'diff' }
             });
 
-            const diffContent = diff.data;
-            console.log('✓ Diff retrieved, length:', diffContent.length);
-
-            // Step 2: Send diff to external API
-            console.log('🔄 Sending diff to API:', API_URL + ENDPOINT);
-            const scanResults = await sendToApi(diffContent);
-
-            if (!scanResults || !scanResults.issues) {
-              console.log('✓ No issues found in code review');
-              return;
-            }
-
-            console.log('⚠️ Found', scanResults.issues.length, 'issues');
-
-            // Step 3: Build review comments from results
-            const comments = buildComments(diffContent, scanResults.issues);
-
-            if (comments.length === 0) {
-              console.log('✓ No line mappings found');
-              return;
-            }
-
-            // Step 4: Post review with comments
-            console.log('📝 Posting review with', comments.length, 'comments...');
-            const review = await github.rest.pulls.createReview({
-              owner,
-              repo,
-              pull_number: prNumber,
-              event: 'COMMENT',
-              comments: comments
+            console.log("🚀 Sending Code to Enterprise Engine...");
+            
+            // Call Python Backend
+            const response = await fetch(`${process.env.API_URL}/scan`, {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({
+                diff: diff.data,
+                commit_messages: context.payload.pull_request.title,
+                industry: "Banking" // Configurable Rule Pack
+              })
+            });
+            
+            const result = await response.json();
+            
+            // Post Comments
+            const comments = result.issues.map(issue => ({
+              path: "app.py", // Simplified for demo, theoretically parses file path
+              line: issue.line || 1,
+              body: `🛡️ **Guardrails Alert** [${issue.severity}]\n\n${issue.message}\n\n*Suggestion: ${issue.suggestion}*`
+            }));
+            
+            // If we have valid line numbers, post review. 
+            // Note: For demo, we might just post a general comment if line mapping is tricky
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `## 🛡️ Guardrails Report\n\n**AI Detection:** ${result.is_ai ? '🤖 Likely AI-Generated' : '👤 Likely Human'}\n**Status:** Found ${result.issues.length} violations.`
             });
 
-            console.log('✓ Review posted, ID:', review.data.id);
-
-            // Helper: Send diff to API
-            async function sendToApi(diffContent) {
-              return new Promise((resolve, reject) => {
-                const protocol = API_URL.startsWith('https') ? https : http;
-                const url = new URL(API_URL + ENDPOINT);
-
-                const payload = JSON.stringify({
-                  diff: diffContent,
-                  timestamp: new Date().toISOString()
-                });
-
-                const options = {
-                  hostname: url.hostname,
-                  port: url.port,
-                  path: url.pathname + url.search,
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/json',
-                    'Content-Length': Buffer.byteLength(payload),
-                    'User-Agent': 'GitHub-Actions-Review'
-                  }
-                };
-
-                if (API_KEY && API_KEY !== 'null') {
-                  options.headers['Authorization'] = 'Bearer ' + API_KEY;
-                }
-
-                const req = protocol.request(options, (res) => {
-                  let data = '';
-                  res.on('data', chunk => { data += chunk; });
-                  res.on('end', () => {
-                    try {
-                      resolve(JSON.parse(data));
-                    } catch (e) {
-                      console.error('Failed to parse API response:', e);
-                      resolve(null);
-                    }
-                  });
-                });
-
-                req.on('error', reject);
-                req.write(payload);
-                req.end();
-              });
-            }
-
-            // Helper: Build comments from issues and diff lines
-            function buildComments(diffContent, issues) {
-              const lines = diffContent.split('\n');
-              const comments = [];
-
-              for (const issue of issues) {
-                const lineNum = issue.line;
-                const position = findPositionInDiff(lines, lineNum);
-
-                if (position !== null) {
-                  const filePath = extractFilePath(diffContent);
-                  comments.push({
-                    path: filePath || 'unknown.file',
-                    position: position,
-                    body: formatComment(issue)
-                  });
-                }
-              }
-
-              return comments;
-            }
-
-            // Helper: Find diff position for a line number
-            function findPositionInDiff(lines, targetLine) {
-              let position = 0;
-              let currentLine = 0;
-
-              for (const line of lines) {
-                position++;
-                
-                // Parse hunk header to get starting line
-                if (line.startsWith('@@')) {
-                  const match = line.match(/@@ .* \+(\d+)/);
-                  if (match) {
-                    currentLine = parseInt(match[1]) - 1;
-                  }
-                } else if (!line.startsWith('\\') && !line.startsWith('diff') && !line.startsWith('index') && !line.startsWith('---') && !line.startsWith('+++')) {
-                  // Increment line counter for non-deleted lines
-                  if (!line.startsWith('-')) {
-                    currentLine++;
-                  }
-
-                  if (currentLine === targetLine) {
-                    return position;
-                  }
-                }
-              }
-              return null;
-            }
-
-            // Helper: Extract file path from diff
-            function extractFilePath(diffContent) {
-              const fileMatch = diffContent.match(/^\+\+\+ b\/(.+?)$/m);
-              return fileMatch ? fileMatch[1] : null;
-            }
-
-            // Helper: Format issue as comment
-            function formatComment(issue) {
-              const severity = issue.severity ? issue.severity.toUpperCase() : 'INFO';
-              const emoji = severity === 'ERROR' ? '🔴' : severity === 'WARNING' ? '🟡' : '🔵';
-              
-              return `${emoji} **[${severity}]** ${issue.message}`;
+            // BLOCK THE MERGE for Critical Issues
+            const blockers = result.issues.filter(i => i.severity === 'BLOCKING' || i.severity === 'CRITICAL');
+            if (blockers.length > 0) {
+                core.setFailed(`⛔ BLOCKED: Found ${blockers.length} Critical/Blocking violations. Compliance required.`);
             }
